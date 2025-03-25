@@ -68,7 +68,7 @@ dev:
 .PHONY: install
 install: build
 	@echo "Installing $(PROJECT_NAME)..."
-	install -m 755 $(BINARY_PATH) /usr/local/bin/$(BINARY_NAME)
+	sudo install -m 755 $(BINARY_PATH) /usr/local/bin/$(BINARY_NAME)
 	@echo "Installation complete!"
 
 # 卸载
