@@ -44,8 +44,6 @@ clean:
 .PHONY: deps
 deps:
 	@echo "Installing dependencies..."
-	$(GOGET) github.com/robfig/cron/v3
-	$(GOGET) github.com/google/uuid
 	@echo "Dependencies installed!"
 
 # 运行程序
