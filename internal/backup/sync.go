@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -61,10 +62,62 @@ func getFileInfo(path string) (*FileInfo, error) {
 	return fileInfo, nil
 }
 
+// 添加一个工作协程的结构体
+type scanWorker struct {
+	jobs    chan string
+	results chan *scanResult
+	dir     string
+	wg      *sync.WaitGroup
+}
+
+// 扫描结果
+type scanResult struct {
+	path     string
+	fileInfo *FileInfo
+	err      error
+}
+
 // scanDirectory 扫描目录下的所有文件
 func scanDirectory(dir string) (map[string]*FileInfo, error) {
-	files := make(map[string]*FileInfo)
+	const numWorkers = 8 // 使用8个工作协程
 
+	files := make(map[string]*FileInfo)
+	var mu sync.Mutex // 用于保护 files map
+	var wg sync.WaitGroup
+
+	// 创建任务和结果通道
+	jobs := make(chan string, 100)
+	results := make(chan *scanResult, 100)
+
+	// 启动工作协程
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		worker := &scanWorker{
+			jobs:    jobs,
+			results: results,
+			dir:     dir,
+			wg:      &wg,
+		}
+		go worker.run()
+	}
+
+	// 启动结果处理协程
+	var processErr error
+	done := make(chan struct{})
+	go func() {
+		for result := range results {
+			if result.err != nil {
+				processErr = result.err
+				continue
+			}
+			mu.Lock()
+			files[result.path] = result.fileInfo
+			mu.Unlock()
+		}
+		close(done)
+	}()
+
+	// 遍历目录并发送任务
 	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -78,22 +131,53 @@ func scanDirectory(dir string) (map[string]*FileInfo, error) {
 			return nil
 		}
 
-		fileInfo, err := getFileInfo(path)
-		if err != nil {
-			return err
-		}
-
-		// 使用相对路径作为键
-		relPath, err := filepath.Rel(dir, path)
-		if err != nil {
-			return err
-		}
-		files[relPath] = fileInfo
-
+		// 发送任务到工作协程
+		jobs <- path
 		return nil
 	})
 
-	return files, err
+	// 关闭任务通道，等待所有工作协程完成
+	close(jobs)
+	wg.Wait()
+	close(results)
+
+	// 等待结果处理完成
+	<-done
+
+	if err != nil {
+		return nil, err
+	}
+	if processErr != nil {
+		return nil, processErr
+	}
+
+	return files, nil
+}
+
+// 工作协程的处理函数
+func (w *scanWorker) run() {
+	defer w.wg.Done()
+
+	for path := range w.jobs {
+		fileInfo, err := getFileInfo(path)
+		if err != nil {
+			w.results <- &scanResult{err: err}
+			continue
+		}
+
+		// 计算相对路径
+		relPath, err := filepath.Rel(w.dir, path)
+		if err != nil {
+			w.results <- &scanResult{err: err}
+			continue
+		}
+
+		w.results <- &scanResult{
+			path:     relPath,
+			fileInfo: fileInfo,
+			err:      nil,
+		}
+	}
 }
 
 // Sync 执行增量同步

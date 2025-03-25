@@ -3,214 +3,362 @@ package backup
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sync"
 	"time"
-
-	"github.com/robfig/cron/v3"
-	"github.com/tangthinker/watchman/internal/config"
 )
 
-// Manager 管理所有备份任务
+// Manager manages backup tasks
 type Manager struct {
-	config     *config.Config
-	cron       *cron.Cron
-	tasks      map[string]*config.BackupTask
 	configFile string
+	tasks      map[string]*BackupTask
+	timers     map[string]*time.Timer
 	mu         sync.RWMutex
 }
 
-// NewManager 创建一个新的备份管理器
+// NewManager creates a new backup manager
 func NewManager(configFile string) (*Manager, error) {
-	m := &Manager{
-		config:     &config.Config{},
-		cron:       cron.New(cron.WithSeconds()),
-		tasks:      make(map[string]*config.BackupTask),
+	// Create config directory if it doesn't exist
+	configDir := filepath.Dir(configFile)
+	if err := os.MkdirAll(configDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create config directory: %v", err)
+	}
+
+	manager := &Manager{
 		configFile: configFile,
+		tasks:      make(map[string]*BackupTask),
+		timers:     make(map[string]*time.Timer),
 	}
 
-	// 加载配置
-	if err := m.loadConfig(); err != nil {
-		return nil, fmt.Errorf("failed to load config: %v", err)
+	// Load existing tasks
+	if err := manager.loadTasks(); err != nil {
+		log.Printf("Warning: failed to load tasks: %v", err)
 	}
 
-	// 启动所有任务
-	m.startAllTasks()
-
-	return m, nil
+	return manager, nil
 }
 
-// loadConfig 从文件加载配置
-func (m *Manager) loadConfig() error {
-	data, err := os.ReadFile(m.configFile)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return m.saveConfig()
-		}
-		return err
-	}
-
-	if err := json.Unmarshal(data, m.config); err != nil {
-		return err
-	}
-
-	// 初始化任务映射
-	for i := range m.config.Tasks {
-		m.tasks[m.config.Tasks[i].ID] = &m.config.Tasks[i]
-	}
-
-	return nil
-}
-
-// saveConfig 保存配置到文件
-func (m *Manager) saveConfig() error {
-	data, err := json.MarshalIndent(m.config, "", "  ")
-	if err != nil {
-		return err
-	}
-
-	// 确保配置目录存在
-	if err := os.MkdirAll(filepath.Dir(m.configFile), 0755); err != nil {
-		return err
-	}
-
-	return os.WriteFile(m.configFile, data, 0644)
-}
-
-// startAllTasks 启动所有任务
-func (m *Manager) startAllTasks() {
-	for _, task := range m.tasks {
-		if task.Status == "running" {
-			m.startTask(task)
-		}
-	}
-	m.cron.Start()
-}
-
-// startTask 启动单个任务
-func (m *Manager) startTask(task *config.BackupTask) {
-	_, err := m.cron.AddFunc(task.Schedule, func() {
-		if err := m.runBackup(task); err != nil {
-			task.Status = "error"
-			task.Error = err.Error()
-			m.saveConfig()
-		}
-	})
-
-	if err != nil {
-		task.Status = "error"
-		task.Error = fmt.Sprintf("Failed to schedule task: %v", err)
-		m.saveConfig()
-	}
-}
-
-// runBackup 执行备份
-func (m *Manager) runBackup(task *config.BackupTask) error {
-	task.Status = "running"
-	task.Progress = 0
-	m.saveConfig()
-
-	// 创建进度通道
-	progressChan := make(chan float64)
-
-	// 在单独的 goroutine 中执行同步
-	errChan := make(chan error, 1)
-	go func() {
-		errChan <- Sync(task.SourcePath, task.TargetPath, progressChan)
-	}()
-
-	// 更新进度
-	for {
-		select {
-		case progress := <-progressChan:
-			task.Progress = progress
-			m.saveConfig()
-		case err := <-errChan:
-			close(progressChan)
-			if err != nil {
-				task.Status = "error"
-				task.Error = err.Error()
-				task.Progress = 0
-			} else {
-				task.Status = "running"
-				task.Progress = 100
-				task.LastBackup = time.Now()
-				task.Error = ""
-			}
-			return m.saveConfig()
-		}
-	}
-}
-
-// AddTask 添加新的备份任务
-func (m *Manager) AddTask(task config.BackupTask) error {
+// AddTask adds a new backup task
+func (m *Manager) AddTask(task BackupTask) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if _, exists := m.tasks[task.ID]; exists {
-		return fmt.Errorf("task with ID %s already exists", task.ID)
+	log.Printf("Adding task to manager: %+v", task)
+
+	// 重新加载任务列表，确保数据是最新的
+	if err := m.loadTasks(); err != nil {
+		log.Printf("Warning: failed to reload tasks: %v", err)
 	}
 
-	task.CreatedAt = time.Now()
-	task.UpdatedAt = time.Now()
-	task.Status = "running"
-
-	m.config.Tasks = append(m.config.Tasks, task)
-	m.tasks[task.ID] = &task
-
-	if err := m.saveConfig(); err != nil {
-		return err
+	// Check if task already exists
+	if _, exists := m.tasks[task.Name]; exists {
+		return fmt.Errorf("task %s already exists", task.Name)
 	}
 
-	m.startTask(&task)
+	// Initialize task status
+	task.Status = "Ready"
+	task.Progress = 100 // 初始状态为 Ready 时，进度应该是 100%
+	task.LastBackup = time.Time{}
+
+	// Store task
+	m.tasks[task.Name] = &task
+
+	log.Printf("Starting backup timer for task: %s", task.Name)
+	// Start backup timer
+	if err := m.startBackupTimer(task.Name); err != nil {
+		delete(m.tasks, task.Name)
+		return fmt.Errorf("failed to start backup timer: %v", err)
+	}
+
+	log.Printf("Saving tasks to file")
+	// Save tasks to file
+	if err := m.saveTasks(); err != nil {
+		delete(m.tasks, task.Name)
+		m.stopBackupTimer(task.Name)
+		return fmt.Errorf("failed to save tasks: %v", err)
+	}
+
+	log.Printf("Task added successfully: %s", task.Name)
 	return nil
 }
 
-// ListTasks 列出所有备份任务
-func (m *Manager) ListTasks() []config.BackupTask {
+// ListTasks returns all backup tasks
+func (m *Manager) ListTasks() []BackupTask {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	tasks := make([]config.BackupTask, 0, len(m.tasks))
+	// // 重新加载任务列表，确保数据是最新的
+	// if err := m.loadTasks(); err != nil {
+	// 	log.Printf("Warning: failed to reload tasks: %v", err)
+	// }
+
+	// log.Printf("Listing %d tasks", len(m.tasks))
+	tasks := make([]BackupTask, 0, len(m.tasks))
 	for _, task := range m.tasks {
 		tasks = append(tasks, *task)
 	}
 	return tasks
 }
 
-// StopTask 停止指定的备份任务
-func (m *Manager) StopTask(taskID string) error {
+// DeleteTask deletes a backup task
+func (m *Manager) DeleteTask(name string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	task, exists := m.tasks[taskID]
-	if !exists {
-		return fmt.Errorf("task with ID %s not found", taskID)
+	// Check if task exists
+	if _, exists := m.tasks[name]; !exists {
+		return fmt.Errorf("task %s does not exist", name)
 	}
 
-	task.Status = "stopped"
-	task.UpdatedAt = time.Now()
-	return m.saveConfig()
+	// Stop backup timer
+	m.stopBackupTimer(name)
+
+	// Delete task
+	delete(m.tasks, name)
+
+	// Save tasks to file
+	if err := m.saveTasks(); err != nil {
+		return fmt.Errorf("failed to save tasks: %v", err)
+	}
+
+	return nil
 }
 
-// DeleteTask 删除指定的备份任务
-func (m *Manager) DeleteTask(taskID string) error {
+// StopTask stops a backup task
+func (m *Manager) StopTask(name string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if _, exists := m.tasks[taskID]; !exists {
-		return fmt.Errorf("task with ID %s not found", taskID)
+	// Check if task exists
+	task, exists := m.tasks[name]
+	if !exists {
+		return fmt.Errorf("task %s does not exist", name)
 	}
 
-	// 从任务列表中删除
-	for i, task := range m.config.Tasks {
-		if task.ID == taskID {
-			m.config.Tasks = append(m.config.Tasks[:i], m.config.Tasks[i+1:]...)
-			break
+	// Stop backup timer
+	m.stopBackupTimer(name)
+
+	// Update task status
+	task.Status = "Stopped"
+	task.Progress = 0 // 停止时设置为 0
+
+	// Save tasks to file
+	if err := m.saveTasks(); err != nil {
+		return fmt.Errorf("failed to save tasks: %v", err)
+	}
+
+	return nil
+}
+
+// Shutdown stops all backup timers
+func (m *Manager) Shutdown() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for name := range m.timers {
+		m.stopBackupTimer(name)
+	}
+}
+
+// loadTasks loads tasks from the config file
+func (m *Manager) loadTasks() error {
+	// 添加日志
+	log.Printf("Loading tasks from file: %s", m.configFile)
+
+	data, err := os.ReadFile(m.configFile)
+	if os.IsNotExist(err) {
+		log.Printf("Config file does not exist, starting with empty task list")
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("failed to read config file: %v", err)
+	}
+
+	var tasks []BackupTask
+	if err := json.Unmarshal(data, &tasks); err != nil {
+		return fmt.Errorf("failed to parse config file: %v", err)
+	}
+
+	// 清空现有任务
+	m.tasks = make(map[string]*BackupTask)
+
+	// 添加日志
+	log.Printf("Found %d tasks in config file", len(tasks))
+
+	for _, task := range tasks {
+		taskCopy := task
+		m.tasks[task.Name] = &taskCopy
+		if task.Status != "Stopped" {
+			if err := m.startBackupTimer(task.Name); err != nil {
+				log.Printf("Warning: failed to start timer for task %s: %v", task.Name, err)
+			}
 		}
 	}
 
-	delete(m.tasks, taskID)
-	return m.saveConfig()
+	return nil
+}
+
+// saveTasks saves tasks to the config file
+func (m *Manager) saveTasks() error {
+	tasks := make([]BackupTask, 0, len(m.tasks))
+	for _, task := range m.tasks {
+		tasks = append(tasks, *task)
+	}
+
+	log.Printf("Saving %d tasks to file: %s", len(tasks), m.configFile)
+	data, err := json.MarshalIndent(tasks, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal tasks: %v", err)
+	}
+
+	// 确保配置目录存在
+	configDir := filepath.Dir(m.configFile)
+	if err := os.MkdirAll(configDir, 0755); err != nil {
+		return fmt.Errorf("failed to create config directory: %v", err)
+	}
+
+	// 添加文件权限检查
+	if err := os.WriteFile(m.configFile, data, 0644); err != nil {
+		log.Printf("Failed to write config file: %v", err)
+		// 尝试检查文件权限
+		if info, statErr := os.Stat(configDir); statErr == nil {
+			log.Printf("Config directory permissions: %v", info.Mode())
+		}
+		return fmt.Errorf("failed to write config file: %v", err)
+	}
+
+	log.Printf("Successfully saved tasks to file")
+	return nil
+}
+
+// startBackupTimer starts a timer for periodic backup
+func (m *Manager) startBackupTimer(name string) error {
+	task := m.tasks[name]
+	interval, err := time.ParseDuration(task.Schedule + "m")
+	if err != nil {
+		return fmt.Errorf("invalid schedule: %v", err)
+	}
+
+	// 打印定时器启动日志
+	log.Printf("[Task: %s] Starting backup timer with interval: %s",
+		task.Name, interval.String())
+
+	timer := time.NewTimer(interval)
+	m.timers[name] = timer
+
+	// 立即执行一次备份
+	log.Printf("[Task: %s] Performing initial backup", task.Name)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[Task: %s] Backup failed: %v", task.Name, r)
+			}
+		}()
+		if err := m.performBackup(name); err != nil {
+			log.Printf("[Task: %s] Backup failed: %v", task.Name, err)
+		}
+	}()
+
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[Task: %s] Backup failed: %v", task.Name, r)
+			}
+		}()
+		for {
+			<-timer.C
+			// 打印定时器触发日志
+			log.Printf("[Task: %s] Timer triggered, starting backup", task.Name)
+
+			if err := m.performBackup(name); err != nil {
+				log.Printf("[Task: %s] Backup failed: %v", task.Name, err)
+			}
+			timer.Reset(interval)
+			// 打印下次备份时间
+			log.Printf("[Task: %s] Next backup scheduled at: %s",
+				task.Name, time.Now().Add(interval).Format("2006-01-02 15:04:05"))
+		}
+	}()
+
+	return nil
+}
+
+// stopBackupTimer stops a backup timer
+func (m *Manager) stopBackupTimer(name string) {
+	if timer, exists := m.timers[name]; exists {
+		timer.Stop()
+		delete(m.timers, name)
+		// 打印停止日志
+		log.Printf("[Task: %s] Backup timer stopped", name)
+	}
+}
+
+// performBackup performs the actual backup operation
+func (m *Manager) performBackup(name string) error {
+	m.mu.Lock()
+	task := m.tasks[name]
+	if task == nil {
+		m.mu.Unlock()
+		return fmt.Errorf("task %s does not exist", name)
+	}
+
+	log.Printf("[Task: %s] Starting backup from %s to %s",
+		task.Name, task.SourcePath, task.TargetPath)
+
+	task.Status = "Running"
+	task.Progress = 0 // 开始备份时设置为 0
+	task.Error = ""
+	m.mu.Unlock()
+
+	// TODO: Implement actual backup logic here
+	// For now, just simulate a backup operation
+	// for i := 0; i <= 100; i += 10 {
+	// 	time.Sleep(100 * time.Millisecond)
+	// 	m.mu.Lock()
+	// 	task.Progress = float64(i)
+	// 	log.Printf("[Task: %s] Progress: %.1f%%", task.Name, task.Progress)
+	// 	m.mu.Unlock()
+	// }
+
+	progressChan := make(chan float64)
+	errChan := make(chan error)
+
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[Task: %s] Backup failed: %v", task.Name, r)
+			}
+		}()
+		errChan <- Sync(task.SourcePath, task.TargetPath, progressChan)
+		close(progressChan)
+		close(errChan)
+	}()
+
+outer:
+	for {
+		select {
+		case err := <-errChan:
+			if err != nil {
+				log.Printf("[Task: %s] Backup failed: %v", task.Name, err)
+			}
+			break outer
+		case progress := <-progressChan:
+			log.Printf("[Task: %s] Progress: %.1f%%", task.Name, progress)
+			m.mu.Lock()
+			task.Progress = progress
+			m.mu.Unlock()
+		}
+	}
+
+	m.mu.Lock()
+	task.Status = "Ready"
+	task.Progress = 100 // 完成备份时设置为 100
+	task.LastBackup = time.Now()
+	log.Printf("[Task: %s] Backup completed successfully at %s",
+		task.Name, task.LastBackup.Format("2006-01-02 15:04:05"))
+	m.mu.Unlock()
+
+	return nil
 }
